@@ -7,7 +7,6 @@ import argparse
 import base64
 import csv
 import json
-import os
 import sys
 import urllib.error
 import urllib.parse
@@ -24,6 +23,7 @@ EBAY_NS = "urn:ebay:apis:eBLBaseComponents"
 NS = {"e": EBAY_NS}
 DEFAULT_COMPATIBILITY_LEVEL = "1455"
 DEFAULT_ENTRIES_PER_PAGE = 200
+DEFAULT_ENV_FILE = ".env"
 ZERO_DECIMAL_CURRENCIES = {
     "BIF",
     "CLP",
@@ -184,6 +184,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional output path. Defaults to stdout.",
     )
     parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=Path(DEFAULT_ENV_FILE),
+        help=f"Credential/config file. Defaults to {DEFAULT_ENV_FILE}.",
+    )
+    parser.add_argument(
         "--csv",
         action="store_true",
         help="Write CSV instead of the default tab-separated text report.",
@@ -195,12 +201,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--site-id",
-        default=os.environ.get("EBAY_SITE_ID", "0"),
-        help="eBay Trading API site ID. Defaults to EBAY_SITE_ID or 0.",
+        help="eBay Trading API site ID. Defaults to EBAY_SITE_ID in .env or 0.",
     )
     parser.add_argument(
         "--compatibility-level",
-        default=os.environ.get("EBAY_COMPAT_LEVEL", DEFAULT_COMPATIBILITY_LEVEL),
+        default=None,
         help=f"Trading API compatibility level. Defaults to {DEFAULT_COMPATIBILITY_LEVEL}.",
     )
     parser.add_argument(
@@ -225,14 +230,62 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_access_token(sandbox: bool, timeout: float) -> str:
-    access_token = os.environ.get("EBAY_OAUTH_ACCESS_TOKEN")
+def valid_env_key(key: str) -> bool:
+    if not key or not (key[0].isalpha() or key[0] == "_"):
+        return False
+    return all(char.isalnum() or char == "_" for char in key)
+
+
+def parse_dotenv_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise SystemExit(f"Could not read {path}: {exc}") from exc
+
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            raise SystemExit(f"{path}:{line_number}: expected KEY=VALUE")
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not valid_env_key(key):
+            raise SystemExit(f"{path}:{line_number}: invalid key {key!r}")
+        values[key] = parse_dotenv_value(value)
+
+    return values
+
+
+def config_value(config: dict[str, str], key: str, default: str | None = None) -> str | None:
+    value = config.get(key)
+    if value is None or value == "":
+        return default
+    return value
+
+
+def get_access_token(config: dict[str, str], config_path: Path, sandbox: bool, timeout: float) -> str:
+    access_token = config_value(config, "EBAY_OAUTH_ACCESS_TOKEN")
     if access_token:
         return access_token
 
-    client_id = os.environ.get("EBAY_CLIENT_ID")
-    client_secret = os.environ.get("EBAY_CLIENT_SECRET")
-    refresh_token = os.environ.get("EBAY_REFRESH_TOKEN")
+    client_id = config_value(config, "EBAY_CLIENT_ID")
+    client_secret = config_value(config, "EBAY_CLIENT_SECRET")
+    refresh_token = config_value(config, "EBAY_REFRESH_TOKEN")
     missing = [
         name
         for name, value in (
@@ -244,7 +297,8 @@ def get_access_token(sandbox: bool, timeout: float) -> str:
     ]
     if missing:
         raise SystemExit(
-            "Missing credentials. Set EBAY_OAUTH_ACCESS_TOKEN, or set "
+            f"Missing credentials in {config_path}. Copy .env.example to {config_path}, then set "
+            "EBAY_OAUTH_ACCESS_TOKEN, or set "
             + ", ".join(missing)
             + "."
         )
@@ -259,7 +313,7 @@ def get_access_token(sandbox: bool, timeout: float) -> str:
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }
-    scopes = os.environ.get("EBAY_OAUTH_SCOPES")
+    scopes = config_value(config, "EBAY_OAUTH_SCOPES")
     if scopes:
         data["scope"] = scopes
 
@@ -544,19 +598,30 @@ def write_row(
 
 def main() -> int:
     args = parse_args()
-    sandbox = args.sandbox or os.environ.get("EBAY_ENV", "").lower() == "sandbox"
+    config = load_dotenv(args.env_file)
+    sandbox = args.sandbox or config_value(config, "EBAY_ENV", "").lower() == "sandbox"
+    site_id = args.site_id or config_value(config, "EBAY_SITE_ID", "0")
+    compatibility_level = (
+        args.compatibility_level
+        or config_value(config, "EBAY_COMPAT_LEVEL", DEFAULT_COMPATIBILITY_LEVEL)
+    )
 
     if not 1 <= args.entries_per_page <= DEFAULT_ENTRIES_PER_PAGE:
         print(f"--entries-per-page must be between 1 and {DEFAULT_ENTRIES_PER_PAGE}.", file=sys.stderr)
         return 2
 
     try:
-        access_token = get_access_token(sandbox=sandbox, timeout=args.timeout)
+        access_token = get_access_token(
+            config=config,
+            config_path=args.env_file,
+            sandbox=sandbox,
+            timeout=args.timeout,
+        )
         client = EbayTradingClient(
             access_token=access_token,
             sandbox=sandbox,
-            site_id=str(args.site_id),
-            compatibility_level=str(args.compatibility_level),
+            site_id=str(site_id),
+            compatibility_level=str(compatibility_level),
             timeout=args.timeout,
         )
         items = active_items(client, args.entries_per_page)
