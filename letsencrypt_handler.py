@@ -43,6 +43,7 @@ class Settings:
     email: str
     agree_tos: bool
     directory_url: str
+    staging: bool
     host: str
     port: int
     cert_root: Path
@@ -270,6 +271,7 @@ def build_settings(config: dict[str, str], args: argparse.Namespace) -> Settings
         email=email,
         agree_tos=agree_tos,
         directory_url=directory_url,
+        staging=staging,
         host=args.host or config_value(config, "LETSENCRYPT_HTTP_HOST", DEFAULT_HTTP_HOST) or DEFAULT_HTTP_HOST,
         port=port,
         cert_root=args.cert_root or Path(config_value(config, "LETSENCRYPT_CERT_ROOT", DEFAULT_CERT_ROOT) or DEFAULT_CERT_ROOT),
@@ -743,6 +745,11 @@ def issue_certificate(settings: Settings) -> None:
     write_certificate_files(settings.cert_dir, certificate_pem)
     print(f"Saved certificate chain: {settings.cert_dir / 'fullchain.pem'}")
     print(f"Saved private key: {settings.cert_dir / 'privkey.pem'}")
+    if settings.staging:
+        print(
+            "This certificate came from Let's Encrypt staging. "
+            "Set LETSENCRYPT_STAGING=false or rerun with --production before using it in a browser."
+        )
 
 
 def main() -> int:

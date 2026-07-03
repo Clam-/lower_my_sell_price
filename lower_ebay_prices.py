@@ -585,12 +585,11 @@ def open_output(path: Path | None) -> tuple[TextIO, bool]:
     return path.open("w", newline="", encoding="utf-8"), True
 
 
-OUTPUT_HEADERS = ["Date/Time", "Listing name", "URL", "Previous price", "New price", "Delta"]
+OUTPUT_HEADERS = ["Listing name", "URL", "Previous price", "New price", "Delta"]
 
 
 def output_values(change: PriceChange, price_decimals: int | None) -> list[str]:
     return [
-        datetime.now().astimezone().isoformat(timespec="seconds"),
         change.listing_name,
         change.url,
         format_money(change.previous_price, change.currency, price_decimals),
@@ -666,6 +665,7 @@ def main() -> int:
     failures = 0
     unchanged = 0
     try:
+        print(f"Run time: {datetime.now().astimezone().isoformat(timespec='seconds')}")
         csv_writer = csv.writer(output_file) if args.csv else None
         write_header(output_file, csv_writer)
 
