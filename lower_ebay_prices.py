@@ -278,6 +278,47 @@ def config_value(config: dict[str, str], key: str, default: str | None = None) -
     return value
 
 
+def token_endpoint(sandbox: bool) -> str:
+    return (
+        "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
+        if sandbox
+        else "https://api.ebay.com/identity/v1/oauth2/token"
+    )
+
+
+def oauth_basic_auth_header(client_id: str, client_secret: str) -> str:
+    credentials = f"{client_id}:{client_secret}".encode("utf-8")
+    return "Basic " + base64.b64encode(credentials).decode("ascii")
+
+
+def request_oauth_token(
+    data: dict[str, str],
+    client_id: str,
+    client_secret: str,
+    sandbox: bool,
+    timeout: float,
+    action: str,
+) -> dict[str, object]:
+    request = urllib.request.Request(
+        token_endpoint(sandbox),
+        data=urllib.parse.urlencode(data).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": oauth_basic_auth_header(client_id, client_secret),
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        raise EbayApiError(f"{action} failed with HTTP {exc.code}: {response_body}") from exc
+    except urllib.error.URLError as exc:
+        raise EbayApiError(f"{action} failed: {exc.reason}") from exc
+
+
 def get_access_token(config: dict[str, str], config_path: Path, sandbox: bool, timeout: float) -> str:
     access_token = config_value(config, "EBAY_OAUTH_ACCESS_TOKEN")
     if access_token:
@@ -303,12 +344,6 @@ def get_access_token(config: dict[str, str], config_path: Path, sandbox: bool, t
             + "."
         )
 
-    token_endpoint = (
-        "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
-        if sandbox
-        else "https://api.ebay.com/identity/v1/oauth2/token"
-    )
-    credentials = f"{client_id}:{client_secret}".encode("utf-8")
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -317,30 +352,22 @@ def get_access_token(config: dict[str, str], config_path: Path, sandbox: bool, t
     if scopes:
         data["scope"] = scopes
 
-    request = urllib.request.Request(
-        token_endpoint,
-        data=urllib.parse.urlencode(data).encode("utf-8"),
-        method="POST",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Authorization": "Basic "
-            + base64.b64encode(credentials).decode("ascii"),
-        },
+    payload = request_oauth_token(
+        data=data,
+        client_id=client_id,
+        client_secret=client_secret,
+        sandbox=sandbox,
+        timeout=timeout,
+        action="OAuth refresh",
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        response_body = exc.read().decode("utf-8", errors="replace")
-        raise EbayApiError(f"OAuth refresh failed with HTTP {exc.code}: {response_body}") from exc
-    except urllib.error.URLError as exc:
-        raise EbayApiError(f"OAuth refresh failed: {exc.reason}") from exc
-
-    try:
-        return payload["access_token"]
+        access_token = payload["access_token"]
     except KeyError as exc:
         raise EbayApiError(f"OAuth refresh response did not include access_token: {payload}") from exc
+    if not isinstance(access_token, str):
+        raise EbayApiError(f"OAuth refresh response did not include access_token: {payload}")
+    return access_token
 
 
 def build_get_active_request(page_number: int, entries_per_page: int) -> ET.Element:
@@ -600,6 +627,7 @@ def main() -> int:
     args = parse_args()
     config = load_dotenv(args.env_file)
     sandbox = args.sandbox or config_value(config, "EBAY_ENV", "").lower() == "sandbox"
+
     site_id = args.site_id or config_value(config, "EBAY_SITE_ID", "0")
     compatibility_level = (
         args.compatibility_level

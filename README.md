@@ -1,10 +1,10 @@
 # lower_my_sell_price
 
-Ad hoc script to lower every active fixed-price eBay listing by a percentage.
+Ad hoc scripts to authenticate with eBay and lower every active fixed-price eBay listing by a percentage.
 
 ## Setup
 
-No Python packages are required. The script reads `.env` automatically; do not commit your real `.env`.
+No Python packages are required. The Let's Encrypt helper uses the local `openssl` command. The scripts read `.env` automatically; do not commit your real `.env`.
 
 1. Copy the template:
 
@@ -29,38 +29,80 @@ EBAY_CLIENT_ID=...
 EBAY_CLIENT_SECRET=...
 ```
 
-6. Get a User token, not an Application token:
+6. Prepare a public HTTPS callback domain.
+
+   You need a domain that points to the machine running these scripts. During certificate issuance, forward external port `80` to local port `8081`. During eBay login, forward external port `443` to local port `8765`.
+
+```dotenv
+LETSENCRYPT_DOMAIN=login.example.com
+LETSENCRYPT_EMAIL=you@example.com
+LETSENCRYPT_AGREE_TOS=true
+LETSENCRYPT_STAGING=true
+```
+
+7. Test the Let's Encrypt HTTP-01 flow against staging:
+
+```sh
+python3.14 letsencrypt_handler.py
+```
+
+   If staging succeeds, request a trusted production certificate:
+
+```sh
+python3.14 letsencrypt_handler.py --production
+```
+
+   The certificate material is written under `certs/<domain>/`:
+   - `fullchain.pem`
+   - `privkey.pem`
+   - `cert.pem`
+   - `chain.pem`
+
+8. Configure the eBay OAuth redirect URL and copy the RuName:
    - On Application Keys, click `User Tokens` next to the same keyset.
-   - In `Get a User Token Here`, choose `OAuth (new security)`.
-   - Sign in as the seller account that owns the listings and agree.
-   - For quick ad hoc use, paste the returned token into `.env`. Leave `EBAY_REFRESH_TOKEN` blank.
+   - In `Get a Token from eBay via your Application`, create/configure Redirect URL settings if prompted.
+   - Set `Auth Accepted URL` to `https://<LETSENCRYPT_DOMAIN>/callback`.
+   - For `Auth Declined URL`, use any HTTPS page you control.
+   - Copy the generated eBay Redirect URL name, also called the `RuName`, into `.env`.
+
+```dotenv
+EBAY_RUNAME=...
+EBAY_OAUTH_ACCEPTED_URL=https://login.example.com/callback
+```
+
+   eBay's OAuth request uses the `RuName` as the `redirect_uri`; the HTTPS URL is configured inside that RuName in the Developer Portal.
+
+9. Get and store a refresh token.
+
+   Make sure external port `443` is forwarding to local port `8765`, then run:
+
+```sh
+python3.14 ebay-login.py
+```
+
+   The login helper starts a temporary HTTPS server on `8765`, prints the eBay sign-in URL, waits for eBay's redirect to `/callback`, exchanges the authorization code, stores `EBAY_REFRESH_TOKEN` in `.env`, and clears `EBAY_OAUTH_ACCESS_TOKEN`.
+
+   If your callback uses a different path or local port:
+
+```sh
+python3.14 ebay-login.py --port 9000 --callback-path /ebay/callback
+```
+
+   If a proxy or tunnel terminates TLS and forwards plain HTTP to this script:
+
+```sh
+python3.14 ebay-login.py --http
+```
+
+   eBay Trading API OAuth calls do not use scopes. The helper sends eBay's base OAuth scope by default; if your Developer Portal sample requires a specific scope list, set `EBAY_OAUTH_SCOPES` in `.env` or pass `--scopes`.
+
+10. Optional: for quick ad hoc use, paste a short-lived User access token into `.env` and leave `EBAY_REFRESH_TOKEN` blank:
 
 ```dotenv
 EBAY_OAUTH_ACCESS_TOKEN=...
 ```
 
-7. For repeat use, use a refresh token instead:
-   - In `User Tokens`, create/configure the RuName if prompted.
-   - Follow eBay's authorization-code flow to exchange the returned `code` for a token response.
-   - Production token endpoint: `https://api.ebay.com/identity/v1/oauth2/token`
-   - Sandbox token endpoint: `https://api.sandbox.ebay.com/identity/v1/oauth2/token`
-
-```sh
-curl -X POST "https://api.ebay.com/identity/v1/oauth2/token" \
-  -u "CLIENT_ID:CLIENT_SECRET" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data-urlencode "grant_type=authorization_code" \
-  --data-urlencode "code=AUTH_CODE_FROM_REDIRECT" \
-  --data-urlencode "redirect_uri=RUNAME"
-```
-
-   The JSON response includes `refresh_token`. Copy it into `.env` and leave `EBAY_OAUTH_ACCESS_TOKEN` blank.
-
-```dotenv
-EBAY_REFRESH_TOKEN=...
-```
-
-8. Set the marketplace and environment in `.env`:
+11. Set the marketplace and environment in `.env`:
 
 ```dotenv
 EBAY_SITE_ID=0
