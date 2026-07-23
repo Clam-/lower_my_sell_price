@@ -94,7 +94,7 @@ python3.14 ebay-login.py --port 9000 --callback-path /ebay/callback
 python3.14 ebay-login.py --http
 ```
 
-   eBay Trading API OAuth calls do not use scopes. The helper sends eBay's base OAuth scope by default; if your Developer Portal sample requires a specific scope list, set `EBAY_OAUTH_SCOPES` in `.env` or pass `--scopes`.
+   The helper requests eBay's base OAuth scope plus `sell.analytics.readonly` by default. The Analytics scope is used for Seller Hub 30-day view counts. If your Developer Portal sample requires a specific scope list, set `EBAY_OAUTH_SCOPES` in `.env` or pass `--scopes`.
 
 10. Optional: for quick ad hoc use, paste a short-lived User access token into `.env` and leave `EBAY_REFRESH_TOKEN` blank:
 
@@ -106,10 +106,13 @@ EBAY_OAUTH_ACCESS_TOKEN=...
 
 ```dotenv
 EBAY_SITE_ID=0
+EBAY_MARKETPLACE_ID=EBAY_US
 EBAY_ENV=production
 ```
 
 Common `EBAY_SITE_ID` values: `0` US, `15` Australia, `3` UK.
+Common `EBAY_MARKETPLACE_ID` values: `EBAY_US`, `EBAY_AU`, `EBAY_GB`.
+For eBay Australia, use `EBAY_SITE_ID=15` and `EBAY_MARKETPLACE_ID=EBAY_AU`.
 
 Helpful eBay docs:
 - [Authorization guide](https://developer.ebay.com/develop/guides-v2/authorization)

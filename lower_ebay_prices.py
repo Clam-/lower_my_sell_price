@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import TextIO
@@ -24,6 +24,43 @@ NS = {"e": EBAY_NS}
 DEFAULT_COMPATIBILITY_LEVEL = "1455"
 DEFAULT_ENTRIES_PER_PAGE = 200
 DEFAULT_ENV_FILE = ".env"
+DEFAULT_MARKETPLACE_ID = "EBAY_US"
+DEFAULT_TRAFFIC_DAYS = 30
+LISTING_NAME_OUTPUT_LENGTH = 32
+MARKETPLACE_ITEM_HOSTS = {
+    "EBAY_AU": "www.ebay.com.au",
+    "EBAY_DE": "www.ebay.de",
+    "EBAY_ES": "www.ebay.es",
+    "EBAY_FR": "www.ebay.fr",
+    "EBAY_GB": "www.ebay.co.uk",
+    "EBAY_IT": "www.ebay.it",
+    "EBAY_US": "www.ebay.com",
+    "EBAY_MOTORS_US": "www.ebay.com",
+}
+SITE_ID_MARKETPLACE_IDS = {
+    "0": "EBAY_US",
+    "3": "EBAY_GB",
+    "15": "EBAY_AU",
+    "71": "EBAY_FR",
+    "77": "EBAY_DE",
+    "100": "EBAY_MOTORS_US",
+    "101": "EBAY_IT",
+    "186": "EBAY_ES",
+}
+SITE_NAME_MARKETPLACE_IDS = {
+    "Australia": "EBAY_AU",
+    "Germany": "EBAY_DE",
+    "Spain": "EBAY_ES",
+    "France": "EBAY_FR",
+    "UK": "EBAY_GB",
+    "Italy": "EBAY_IT",
+    "US": "EBAY_US",
+}
+PRIMARY_CURRENCY_MARKETPLACE_IDS = {
+    "AUD": "EBAY_AU",
+    "GBP": "EBAY_GB",
+    "USD": "EBAY_US",
+}
 ZERO_DECIMAL_CURRENCIES = {
     "BIF",
     "CLP",
@@ -54,6 +91,8 @@ class PriceChange:
     previous_price: Decimal
     new_price: Decimal
     currency: str
+    views: str = ""
+    watchers: str = ""
     sku: str | None = None
 
     @property
@@ -130,6 +169,41 @@ class EbayTradingClient:
         return response_root
 
 
+class EbayAnalyticsClient:
+    def __init__(self, access_token: str, sandbox: bool, timeout: float) -> None:
+        self.access_token = access_token
+        self.timeout = timeout
+        self.endpoint = (
+            "https://api.sandbox.ebay.com/sell/analytics/v1"
+            if sandbox
+            else "https://api.ebay.com/sell/analytics/v1"
+        )
+
+    def get(self, path: str, params: dict[str, str]) -> dict[str, object]:
+        url = f"{self.endpoint}{path}?{urllib.parse.urlencode(params)}"
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.access_token}",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            raise EbayApiError(
+                f"Analytics API HTTP {exc.code}: {format_rest_error(response_body)}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise EbayApiError(f"Analytics API request failed: {exc.reason}") from exc
+        except json.JSONDecodeError as exc:
+            raise EbayApiError("Analytics API returned invalid JSON") from exc
+
+
 def q(name: str) -> str:
     return f"{{{EBAY_NS}}}{name}"
 
@@ -204,6 +278,13 @@ def parse_args() -> argparse.Namespace:
         help="eBay Trading API site ID. Defaults to EBAY_SITE_ID in .env or 0.",
     )
     parser.add_argument(
+        "--marketplace-id",
+        help=(
+            "eBay marketplace ID for Analytics views, for example EBAY_AU. "
+            "Defaults to EBAY_MARKETPLACE_ID in .env or a value derived from --site-id."
+        ),
+    )
+    parser.add_argument(
         "--compatibility-level",
         default=None,
         help=f"Trading API compatibility level. Defaults to {DEFAULT_COMPATIBILITY_LEVEL}.",
@@ -226,6 +307,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=30.0,
         help="HTTP timeout in seconds. Defaults to 30.",
+    )
+    parser.add_argument(
+        "--traffic-days",
+        type=int,
+        default=DEFAULT_TRAFFIC_DAYS,
+        help=f"Days of traffic views to request. Defaults to {DEFAULT_TRAFFIC_DAYS}.",
     )
     return parser.parse_args()
 
@@ -276,6 +363,30 @@ def config_value(config: dict[str, str], key: str, default: str | None = None) -
     if value is None or value == "":
         return default
     return value
+
+
+def marketplace_id_from_site_id(site_id: str) -> str:
+    return SITE_ID_MARKETPLACE_IDS.get(site_id, DEFAULT_MARKETPLACE_ID)
+
+
+def marketplace_id_from_items(items: list[ET.Element], default: str) -> str:
+    for item in items:
+        site = find_text(item, "Site")
+        if site in SITE_NAME_MARKETPLACE_IDS:
+            return SITE_NAME_MARKETPLACE_IDS[site]
+
+    for item in items:
+        price = price_from(find(item, "SellingStatus/CurrentPrice")) or price_from(find(item, "StartPrice"))
+        if price:
+            currency = price[1].upper()
+            if currency in PRIMARY_CURRENCY_MARKETPLACE_IDS:
+                return PRIMARY_CURRENCY_MARKETPLACE_IDS[currency]
+
+    return default
+
+
+def item_url_host(marketplace_id: str) -> str:
+    return MARKETPLACE_ITEM_HOSTS.get(marketplace_id.upper(), MARKETPLACE_ITEM_HOSTS[DEFAULT_MARKETPLACE_ID])
 
 
 def token_endpoint(sandbox: bool) -> str:
@@ -413,6 +524,156 @@ def active_items(
     return items
 
 
+def build_get_item_request(item_id: str) -> ET.Element:
+    root = ET.Element(q("GetItemRequest"))
+    ET.SubElement(root, q("ItemID")).text = item_id
+    ET.SubElement(root, q("IncludeWatchCount")).text = "true"
+    ET.SubElement(root, q("DetailLevel")).text = "ReturnAll"
+    return root
+
+
+def item_with_listing_metrics(client: EbayTradingClient, item: ET.Element) -> ET.Element:
+    item_id = find_text(item, "ItemID")
+    if not item_id:
+        return item
+
+    try:
+        response = client.call("GetItem", build_get_item_request(item_id))
+    except EbayApiError as exc:
+        print(f"Could not fetch watcher details for item {item_id}: {exc}", file=sys.stderr)
+        return item
+
+    detailed_item = find(response, "Item")
+    return detailed_item if detailed_item is not None else item
+
+
+def first_text(element: ET.Element, paths: list[str], default: str = "") -> str:
+    for path in paths:
+        value = find_text(element, path)
+        if value:
+            return value
+    return default
+
+
+def utc_offset_text(timestamp: datetime) -> str:
+    offset = timestamp.utcoffset()
+    if offset is None:
+        return "+00:00"
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def traffic_report_date_range(days: int) -> str:
+    now = datetime.now().astimezone()
+    start_date = now.date() - timedelta(days=days - 1)
+    end_date = now.date()
+    offset = utc_offset_text(now)
+    return (
+        f"[{start_date.isoformat()}T00:00:00.000{offset}"
+        f"..{end_date.isoformat()}T23:59:59.000{offset}]"
+    )
+
+
+def value_payload(value: object) -> object:
+    if isinstance(value, dict):
+        return value.get("value")
+    return None
+
+
+def count_text(value: object) -> str:
+    if value is None:
+        return "0"
+    try:
+        decimal_value = Decimal(str(value))
+    except InvalidOperation:
+        return str(value)
+    if decimal_value == decimal_value.to_integral_value():
+        return str(int(decimal_value))
+    return plain_decimal(decimal_value.normalize())
+
+
+def listing_views_from_traffic_report(report: dict[str, object]) -> dict[str, str]:
+    metric_index = 0
+    header = report.get("header")
+    if isinstance(header, dict):
+        metrics = header.get("metrics")
+        if isinstance(metrics, list):
+            metric_keys = [
+                metric.get("key")
+                for metric in metrics
+                if isinstance(metric, dict)
+            ]
+            if "LISTING_VIEWS_TOTAL" in metric_keys:
+                metric_index = metric_keys.index("LISTING_VIEWS_TOTAL")
+
+    views: dict[str, str] = {}
+    records = report.get("records")
+    if not isinstance(records, list):
+        return views
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        dimension_values = record.get("dimensionValues")
+        metric_values = record.get("metricValues")
+        if not isinstance(dimension_values, list) or not isinstance(metric_values, list):
+            continue
+        if not dimension_values or len(metric_values) <= metric_index:
+            continue
+
+        listing_id = value_payload(dimension_values[0])
+        metric = metric_values[metric_index]
+        if not isinstance(listing_id, str):
+            continue
+        if isinstance(metric, dict) and metric.get("applicable") is False:
+            views[listing_id] = "0"
+            continue
+        views[listing_id] = count_text(value_payload(metric))
+
+    return views
+
+
+def batched(values: list[str], size: int) -> list[list[str]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def traffic_views_by_item_id(
+    client: EbayAnalyticsClient,
+    item_ids: list[str],
+    marketplace_id: str,
+    traffic_days: int,
+) -> dict[str, str]:
+    views: dict[str, str] = {}
+    unique_item_ids = list(dict.fromkeys(item_ids))
+
+    for item_id_batch in batched(unique_item_ids, 200):
+        filter_value = (
+            f"listing_ids:{{{'|'.join(item_id_batch)}}},"
+            f"marketplace_ids:{{{marketplace_id}}},"
+            f"date_range:{traffic_report_date_range(traffic_days)}"
+        )
+        report = client.get(
+            "/traffic_report",
+            {
+                "dimension": "LISTING",
+                "filter": filter_value,
+                "metric": "LISTING_VIEWS_TOTAL",
+            },
+        )
+
+        warnings = report.get("warnings")
+        if isinstance(warnings, list):
+            for warning in warnings:
+                print(f"Warning from Analytics API: {format_rest_error_obj(warning)}", file=sys.stderr)
+
+        views.update(listing_views_from_traffic_report(report))
+
+    return views
+
+
 def price_from(element: ET.Element | None) -> tuple[Decimal, str] | None:
     if element is None or element.text is None:
         return None
@@ -445,12 +706,20 @@ def lowered_price(previous_price: Decimal, percent: Decimal, decimals: int) -> D
     return new_price
 
 
-def listing_url(item: ET.Element, item_id: str) -> str:
-    return (
+def strip_listing_title_from_url(url: str, item_id: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, f"/itm/{item_id}", "", "", ""))
+
+
+def listing_url(item: ET.Element, item_id: str, marketplace_id: str) -> str:
+    url = (
         find_text(item, "ListingDetails/ViewItemURL")
         or find_text(item, "ListingDetails/ViewItemURLForNaturalSearch")
-        or f"https://www.ebay.com/itm/{item_id}"
+        or f"https://{item_url_host(marketplace_id)}/itm/{item_id}"
     )
+    return strip_listing_title_from_url(url, item_id)
 
 
 def variation_label(variation: ET.Element) -> str:
@@ -475,6 +744,8 @@ def build_price_changes(
     item: ET.Element,
     percent: Decimal,
     price_decimals: int | None,
+    marketplace_id: str = DEFAULT_MARKETPLACE_ID,
+    views_by_item_id: dict[str, str] | None = None,
 ) -> list[PriceChange]:
     item_id = find_text(item, "ItemID")
     if not item_id:
@@ -482,7 +753,9 @@ def build_price_changes(
         return []
 
     title = find_text(item, "Title", f"Item {item_id}") or f"Item {item_id}"
-    url = listing_url(item, item_id)
+    url = listing_url(item, item_id, marketplace_id)
+    views = (views_by_item_id or {}).get(item_id) or first_text(item, ["HitCount"], "0")
+    watchers = first_text(item, ["WatchCount"], "0")
     variations = item.findall("e:Variations/e:Variation", NS)
     changes: list[PriceChange] = []
 
@@ -507,6 +780,7 @@ def build_price_changes(
             decimals = currency_decimals(currency, price_decimals)
             label = variation_label(variation)
             display_name = f"{title} [{label}]" if label else title
+            variation_watchers = first_text(variation, ["WatchCount"], watchers)
             changes.append(
                 PriceChange(
                     item_id=item_id,
@@ -515,6 +789,8 @@ def build_price_changes(
                     previous_price=previous,
                     new_price=lowered_price(previous, percent, decimals),
                     currency=currency,
+                    views=views,
+                    watchers=variation_watchers,
                     sku=sku,
                 )
             )
@@ -535,6 +811,8 @@ def build_price_changes(
             previous_price=previous,
             new_price=lowered_price(previous, percent, decimals),
             currency=currency,
+            views=views,
+            watchers=watchers,
             sku=find_text(item, "SKU"),
         )
     )
@@ -568,6 +846,31 @@ def format_errors(root: ET.Element) -> str:
     return "; ".join(errors) if errors else "unknown eBay API error"
 
 
+def format_rest_error_obj(error: object) -> str:
+    if not isinstance(error, dict):
+        return str(error)
+    pieces = [
+        str(error.get(key))
+        for key in ("category", "errorId", "message", "longMessage")
+        if error.get(key)
+    ]
+    return " | ".join(pieces) if pieces else str(error)
+
+
+def format_rest_error(response_body: str) -> str:
+    try:
+        payload = json.loads(response_body)
+    except json.JSONDecodeError:
+        return response_body
+
+    if isinstance(payload, dict):
+        errors = payload.get("errors")
+        if isinstance(errors, list) and errors:
+            return "; ".join(format_rest_error_obj(error) for error in errors)
+        return str(payload)
+    return str(payload)
+
+
 def plain_decimal(value: Decimal) -> str:
     return format(value, "f")
 
@@ -585,13 +888,15 @@ def open_output(path: Path | None) -> tuple[TextIO, bool]:
     return path.open("w", newline="", encoding="utf-8"), True
 
 
-OUTPUT_HEADERS = ["Listing name", "URL", "Previous price", "New price", "Delta"]
+OUTPUT_HEADERS = ["Listing name", "URL", "Views", "Watchers", "Previous price", "New price", "Delta"]
 
 
 def output_values(change: PriceChange, price_decimals: int | None) -> list[str]:
     return [
-        change.listing_name,
+        change.listing_name[:LISTING_NAME_OUTPUT_LENGTH],
         change.url,
+        change.views,
+        change.watchers,
         format_money(change.previous_price, change.currency, price_decimals),
         format_money(change.new_price, change.currency, price_decimals),
         format_money(change.delta, change.currency, price_decimals),
@@ -628,6 +933,8 @@ def main() -> int:
     sandbox = args.sandbox or config_value(config, "EBAY_ENV", "").lower() == "sandbox"
 
     site_id = args.site_id or config_value(config, "EBAY_SITE_ID", "0")
+    configured_marketplace_id = args.marketplace_id or config_value(config, "EBAY_MARKETPLACE_ID")
+    marketplace_id = str(configured_marketplace_id or marketplace_id_from_site_id(str(site_id))).upper()
     compatibility_level = (
         args.compatibility_level
         or config_value(config, "EBAY_COMPAT_LEVEL", DEFAULT_COMPATIBILITY_LEVEL)
@@ -635,6 +942,9 @@ def main() -> int:
 
     if not 1 <= args.entries_per_page <= DEFAULT_ENTRIES_PER_PAGE:
         print(f"--entries-per-page must be between 1 and {DEFAULT_ENTRIES_PER_PAGE}.", file=sys.stderr)
+        return 2
+    if not 1 <= args.traffic_days <= 90:
+        print("--traffic-days must be between 1 and 90.", file=sys.stderr)
         return 2
 
     try:
@@ -652,10 +962,34 @@ def main() -> int:
             timeout=args.timeout,
         )
         items = active_items(client, args.entries_per_page)
+        if not configured_marketplace_id:
+            marketplace_id = marketplace_id_from_items(items, marketplace_id).upper()
+        item_ids = [item_id for item in items if (item_id := find_text(item, "ItemID"))]
+        try:
+            views_by_item_id = traffic_views_by_item_id(
+                client=EbayAnalyticsClient(
+                    access_token=access_token,
+                    sandbox=sandbox,
+                    timeout=args.timeout,
+                ),
+                item_ids=item_ids,
+                marketplace_id=str(marketplace_id),
+                traffic_days=args.traffic_days,
+            )
+        except EbayApiError as exc:
+            views_by_item_id = {}
+            print(f"Could not fetch Seller Hub views from Analytics API: {exc}", file=sys.stderr)
+        items = [item_with_listing_metrics(client, item) for item in items]
         changes = [
             change
             for item in items
-            for change in build_price_changes(item, args.percent, args.price_decimals)
+            for change in build_price_changes(
+                item,
+                args.percent,
+                args.price_decimals,
+                marketplace_id=str(marketplace_id),
+                views_by_item_id=views_by_item_id,
+            )
         ]
     except EbayApiError as exc:
         print(exc, file=sys.stderr)

@@ -22,7 +22,10 @@ DEFAULT_CALLBACK_PATH = "/callback"
 DEFAULT_ENV_FILE = ".env"
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 8765
-DEFAULT_LOGIN_SCOPE = "https://api.ebay.com/oauth/api_scope"
+DEFAULT_LOGIN_SCOPE = (
+    "https://api.ebay.com/oauth/api_scope "
+    "https://api.ebay.com/oauth/api_scope/sell.analytics.readonly"
+)
 DEFAULT_LOGIN_TIMEOUT = 300.0
 DEFAULT_REQUEST_TIMEOUT = 30.0
 
